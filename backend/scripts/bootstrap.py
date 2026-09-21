@@ -20,7 +20,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from sqlalchemy import func, select  # noqa: E402
+
 from app.database.session import SessionLocal  # noqa: E402
+from app.models import DataProvenance, WeatherObservation  # noqa: E402
 from app.services.pipeline import load_weather_frame, run_pipeline  # noqa: E402
 from app.services.weather.ingest import (  # noqa: E402
     get_primary_station,
@@ -33,6 +36,10 @@ from app.services.weather.providers import (  # noqa: E402
 )
 
 
+#: Enough real history for the ML models to train on (~2 months hourly).
+MIN_HISTORY_ROWS = 1200
+
+
 def banner(text: str) -> None:
     print()
     print("=" * 68)
@@ -41,7 +48,26 @@ def banner(text: str) -> None:
 
 
 async def backfill(db, days: int) -> int:
-    """Pull real ERA5 reanalysis history so the models have training data."""
+    """Pull real ERA5 reanalysis history so the models have training data.
+
+    Idempotent: if the database already holds enough historical observations
+    it returns immediately. That makes this safe to put in a deployment start
+    command - the first boot does the work, and every restart afterwards
+    (including a free-tier wake from sleep) skips it in milliseconds instead
+    of re-downloading months of data.
+    """
+    station = get_primary_station(db)
+    existing = db.scalar(
+        select(func.count(WeatherObservation.id)).where(
+            WeatherObservation.station_id == station.id,
+            WeatherObservation.provenance == DataProvenance.REAL_OBSERVED,
+        )
+    ) or 0
+    if existing >= MIN_HISTORY_ROWS:
+        print(f"  {existing:,} historical observations already present - "
+              "skipping backfill")
+        return 0
+
     end = datetime.now(timezone.utc).date() - timedelta(days=6)  # ERA5 lag
     start = end - timedelta(days=days)
     provider = OpenMeteoArchiveProvider(
@@ -55,7 +81,6 @@ async def backfill(db, days: int) -> int:
               "Training may be skipped until enough live data accumulates.")
         return 0
 
-    station = get_primary_station(db)
     written, skipped = persist_readings(
         db, station.id, outcome.usable_readings,
         fetched_at=datetime.now(timezone.utc),
