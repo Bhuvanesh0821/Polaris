@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -140,6 +140,63 @@ def get_station(db: Session) -> Station:
     if st is None:
         raise RuntimeError(f"Station {SITE.station_code} not provisioned")
     return st
+
+
+#: Real hourly observations needed before the ML models can be trained.
+MIN_HISTORY_ROWS = 1200
+
+
+async def backfill_history_if_needed(db: Session, days: int = 90) -> int:
+    """Top up real historical weather when the store is too thin to train on.
+
+    Called from the scheduled refresh so a deployment is self-healing: if the
+    one-off boot backfill was rate-limited (common on shared-IP hosting,
+    where another tenant can exhaust a per-IP quota), the next cycle simply
+    tries again. Once enough history exists this returns immediately.
+
+    It never fabricates history - a failure just leaves the store thin and
+    the models untrained, which the API reports honestly.
+    """
+    from app.services.weather.ingest import (
+        get_primary_station,
+        persist_readings,
+        update_source_status,
+    )
+    from app.services.weather.providers import OpenMeteoArchiveProvider
+
+    station = get_primary_station(db)
+    existing = db.scalar(
+        select(func.count(WeatherObservation.id)).where(
+            WeatherObservation.station_id == station.id,
+            WeatherObservation.provenance == DataProvenance.REAL_OBSERVED,
+        )
+    ) or 0
+    if existing >= MIN_HISTORY_ROWS:
+        return 0
+
+    end = datetime.now(timezone.utc).date() - timedelta(days=6)  # ERA5 lag
+    start = end - timedelta(days=days)
+    provider = OpenMeteoArchiveProvider(
+        start_date=start.isoformat(), end_date=end.isoformat()
+    )
+    log.info("History is thin (%d rows); attempting ERA5 backfill %s -> %s",
+             existing, start, end)
+    outcome = await provider.fetch()
+    if not outcome.ok:
+        log.warning("Backfill attempt failed (%s). Will retry next cycle.",
+                    outcome.error)
+        update_source_status(db, provider, outcome, is_active=False)
+        db.commit()
+        return 0
+
+    written, _ = persist_readings(
+        db, station.id, outcome.usable_readings,
+        fetched_at=datetime.now(timezone.utc),
+    )
+    update_source_status(db, provider, outcome, is_active=False)
+    db.commit()
+    log.info("Backfilled %d real historical observations", written)
+    return written
 
 
 def anchor_energy_state() -> dict:
