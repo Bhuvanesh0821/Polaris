@@ -1,0 +1,17 @@
+# Normalise line endings so the repo is identical across Windows/Linux CI.
+* text=auto eol=lf
+
+# Shell scripts and Docker files must keep LF or they break in Linux images.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.conf      text eol=lf
+Procfile    text eol=lf
+
+# Windows-only helper stays CRLF.
+*.ps1       text eol=crlf
+
+# Binary
+*.png binary
+*.jpg binary
+*.gz  binary
+*.joblib binary

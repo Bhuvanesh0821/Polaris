@@ -1,0 +1,179 @@
+/* ==========================================================================
+   POLARIS design tokens
+   Engineering-console aesthetic: white ground, dark green + blue structure,
+   light green/cyan surfaces, dense type, minimal motion.
+   ========================================================================== */
+
+:root {
+  /* --- brand: dark green (primary) --- */
+  --pol-green-900: #06332a;
+  --pol-green-800: #0b4f3f;
+  --pol-green-700: #0f6b54;
+  --pol-green-600: #14856a;
+  --pol-green-500: #2e9e7e;
+  --pol-green-300: #7fd6b8;
+  --pol-green-100: #d8f2e8;
+  --pol-green-50:  #eefaf5;
+
+  /* --- brand: blue (secondary) --- */
+  --pol-blue-900: #06263c;
+  --pol-blue-800: #0b3c5d;
+  --pol-blue-700: #12547f;
+  --pol-blue-600: #1264a3;
+  --pol-blue-500: #2b83c4;
+  --pol-blue-300: #8ec6e8;
+  --pol-blue-100: #ddeefa;
+  --pol-blue-50:  #f0f8fe;
+
+  /* --- cyan accent --- */
+  --pol-cyan-600: #0e7c8c;
+  --pol-cyan-500: #14a0b4;
+  --pol-cyan-300: #7fd4e2;
+  --pol-cyan-100: #d9f3f8;
+  --pol-cyan-50:  #eefafd;
+
+  /* --- neutrals --- */
+  --pol-ink:      #0d1b1a;
+  --pol-text:     #22322f;
+  --pol-muted:    #5c706c;
+  --pol-faint:    #879894;
+  --pol-line:     #dde5e2;
+  --pol-line-soft:#eaf0ee;
+  --pol-surface:  #ffffff;
+  --pol-bg:       #f6f9f8;
+  --pol-bg-alt:   #eef4f2;
+
+  /* --- status --- */
+  --pol-ok:       #0f7a4f;
+  --pol-ok-bg:    #e4f6ec;
+  --pol-warn:     #9a6200;
+  --pol-warn-bg:  #fdf1dc;
+  --pol-crit:     #b3261e;
+  --pol-crit-bg:  #fdeae8;
+  --pol-emerg:    #7d1710;
+  --pol-emerg-bg: #fbdedb;
+  --pol-info:     #12547f;
+  --pol-info-bg:  #e6f2fb;
+  --pol-live:     #0f7a4f;
+  --pol-stale:    #9a6200;
+  --pol-fail:     #b3261e;
+
+  /* --- data series (charts) --- */
+  --series-wind:      #1264a3;
+  --series-solar:     #d99400;
+  --series-generator: #a04a2f;
+  --series-load:      #0b4f3f;
+  --series-critical:  #b3261e;
+  --series-battery:   #14a0b4;
+  --series-fuel:      #6b5b95;
+  --series-renewable: #2e9e7e;
+
+  /* --- priority ladder --- */
+  --p1: #0b4f3f;
+  --p2: #1264a3;
+  --p3: #2e9e7e;
+  --p4: #7fd4e2;
+
+  /* --- geometry --- */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 9px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  --shadow-sm: 0 1px 2px rgba(13, 27, 26, 0.05);
+  --shadow-md: 0 2px 6px rgba(13, 27, 26, 0.07);
+  --shadow-lg: 0 8px 24px rgba(13, 27, 26, 0.10);
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  --sidebar-w: 236px;
+  --topbar-h: 56px;
+  --banner-h: 30px;
+}
+
+/* ==========================================================================
+   Reset
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--pol-text);
+  background: var(--pol-bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, h4, h5 { margin: 0; font-weight: 600; color: var(--pol-ink); letter-spacing: -0.01em; }
+h1 { font-size: 19px; }
+h2 { font-size: 15px; }
+h3 { font-size: 13.5px; }
+p { margin: 0 0 var(--sp-3); }
+a { color: var(--pol-blue-600); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button { font-family: inherit; font-size: inherit; cursor: pointer; }
+input, select, textarea { font-family: inherit; font-size: inherit; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--pol-bg-alt); }
+::-webkit-scrollbar-thumb { background: #c3d2ce; border-radius: 5px; border: 2px solid var(--pol-bg-alt); }
+::-webkit-scrollbar-thumb:hover { background: #a8bcb6; }
+
+/* ==========================================================================
+   Numeric type — tabular figures everywhere numbers are compared
+   ========================================================================== */
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/* ==========================================================================
+   Utility
+   ========================================================================== */
+
+.row { display: flex; align-items: center; }
+.row-between { display: flex; align-items: center; justify-content: space-between; }
+.gap-1 { gap: var(--sp-1); }
+.gap-2 { gap: var(--sp-2); }
+.gap-3 { gap: var(--sp-3); }
+.gap-4 { gap: var(--sp-4); }
+.wrap { flex-wrap: wrap; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.muted { color: var(--pol-muted); }
+.faint { color: var(--pol-faint); }
+.tiny { font-size: 11px; }
+.small { font-size: 12px; }
+.upper { text-transform: uppercase; letter-spacing: 0.06em; }
+.strong { font-weight: 600; }
+.nowrap { white-space: nowrap; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mt-2 { margin-top: var(--sp-2); }
+.mt-3 { margin-top: var(--sp-3); }
+.mt-4 { margin-top: var(--sp-4); }
+.mb-2 { margin-bottom: var(--sp-2); }
+.mb-3 { margin-bottom: var(--sp-3); }
+.mb-4 { margin-bottom: var(--sp-4); }
+.text-right { text-align: right; }
+.text-center { text-align: center; }

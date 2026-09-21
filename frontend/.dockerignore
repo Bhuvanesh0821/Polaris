@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vite/
+.env
+.env.local
+npm-debug.log*
+.git/
+.gitignore
+Dockerfile
+.dockerignore

@@ -1,0 +1,36 @@
+# --- secrets (never commit) ---
+.env
+.env.*
+!.env.example
+!.env.docker.example
+backend/.env
+frontend/.env
+*.env.local
+*.pem
+*.key
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- trained models ---
+backend/artifacts/*.joblib
+
+# --- node ---
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+
+# --- editors / os ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
