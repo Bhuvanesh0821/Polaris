@@ -1,0 +1,20 @@
+# Secrets - must never enter an image layer
+.env
+*.env.local
+
+# Local virtualenv (the image builds its own)
+.venv/
+venv/
+
+# Caches and test artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Trained models are regenerated at runtime
+artifacts/*.joblib
+
+.git/
+.gitignore

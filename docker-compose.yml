@@ -1,0 +1,89 @@
+# =========================================================================
+# POLARIS - production-like local stack
+#   Python | FastAPI | React | PostgreSQL | JavaScript | HTML/CSS
+#
+#   cp .env.docker.example .env      # then set POSTGRES_PASSWORD
+#   docker compose up --build
+#
+#   frontend  http://localhost:8080   (nginx serving the built React bundle)
+#   backend   http://localhost:8000/api/health
+#   database  localhost:5433          (5433 avoids clashing with a local install)
+#
+# The backend needs outbound internet to reach the weather providers.
+# POLARIS does not fabricate weather: with no network it reports a
+# STALE/FAILED source status rather than inventing readings.
+# =========================================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: polaris-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-polaris}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-polaris}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5433:5432"
+    volumes:
+      - polaris_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-polaris} -d ${POSTGRES_DB:-polaris}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: polaris-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      ENABLE_DOCS: "true"
+      POSTGRES_USER: ${POSTGRES_USER:-polaris}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-polaris}
+      # The browser calls the API from localhost:8080, so that is the origin
+      # that must be allowed - not the container name.
+      CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+      ALLOW_NETWORK_INGEST: "true"
+      HISTORY_DAYS: "120"
+      FORECAST_HORIZON_H: "168"
+    ports:
+      - "8000:8000"
+    volumes:
+      - polaris_models:/app/artifacts
+    # Schema first, then one real ingest + AI pass, then serve.
+    command: >
+      sh -c "python -m scripts.init_db &&
+             python -m scripts.bootstrap --days 90 &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000
+             --proxy-headers --forwarded-allow-ips='*'"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Inlined into the bundle at build time by Vite.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000/api}
+    container_name: polaris-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  polaris_pgdata:
+  polaris_models:

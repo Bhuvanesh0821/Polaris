@@ -1,0 +1,646 @@
+"""LIVE weather providers.
+
+POLARIS pulls real observations from real sources. Every provider returns
+`WeatherReading` objects carrying the raw provider payload, so any value the
+dashboard shows can be traced to the bytes the source returned.
+
+Provider chain (lowest `priority` is tried first)
+-------------------------------------------------
+10  OgimetSynopProvider   AUTHORITATIVE. Maitri (WMO 89514), an Indian
+                          Antarctic Programme station, via WMO GTS SYNOP
+                          bulletins relayed by OGIMET. 6-hourly. Carries no
+                          radiation group and usually no dewpoint.
+20  OpenMeteoProvider     Hourly resolution, solar radiation and the forecast
+                          horizon the AI models need, at Maitri's real
+                          coordinates.
+30  NoaaMetarProvider     NOAA Aviation Weather Center METAR from Antarctic
+                          aerodromes. Independent failover for the core
+                          variables.
+
+There is deliberately no synthetic provider. If every provider fails, the
+ingestor records the failure and the API serves the last genuinely observed
+row, flagged stale.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import httpx
+
+from app.config import settings
+from app.core.station import SITE
+from app.models.base import DataProvenance
+from app.services.weather.synop import parse_ogimet_csv, relative_humidity
+
+log = logging.getLogger("polaris.weather")
+
+USER_AGENT = "POLARIS/1.0 (polar station energy research)"
+KNOTS_TO_MS = 0.5144444
+
+
+# ---------------------------------------------------------------------------
+# Value objects
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WeatherReading:
+    """One observation or forecast hour from one provider."""
+
+    observed_at: datetime
+    provenance: DataProvenance
+    source: str
+    source_provider: str
+    source_station_code: str | None = None
+
+    temperature_c: float | None = None
+    apparent_temperature_c: float | None = None
+    wind_speed_ms: float | None = None
+    wind_gust_ms: float | None = None
+    wind_direction_deg: float | None = None
+    solar_radiation_wm2: float | None = None
+    direct_radiation_wm2: float | None = None
+    diffuse_radiation_wm2: float | None = None
+    humidity_pct: float | None = None
+    pressure_hpa: float | None = None
+    cloud_cover_pct: float | None = None
+    snowfall_mm: float | None = None
+    weather_text: str | None = None
+    is_blizzard: bool = False
+
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_usable(self) -> bool:
+        """POLARIS only persists readings with the two variables the energy
+        model cannot run without."""
+        return self.temperature_c is not None and self.wind_speed_ms is not None
+
+    @property
+    def is_forecast(self) -> bool:
+        return self.provenance == DataProvenance.REAL_FORECAST
+
+
+@dataclass
+class ProviderOutcome:
+    provider_key: str
+    provider_label: str
+    ok: bool
+    readings: list[WeatherReading] = field(default_factory=list)
+    endpoint: str = ""
+    http_status: int | None = None
+    latency_ms: float = 0.0
+    attempts: int = 1
+    error: str | None = None
+
+    @property
+    def usable_readings(self) -> list[WeatherReading]:
+        return [r for r in self.readings if r.is_usable]
+
+
+# ---------------------------------------------------------------------------
+# Base provider
+# ---------------------------------------------------------------------------
+
+
+class WeatherProvider(ABC):
+    key: str = "base"
+    label: str = "Base provider"
+    priority: int = 100
+    supports_solar_radiation: bool = False
+    freshness_window_s: int = 3600
+    max_attempts: int = 3
+    backoff_base_s: float = 1.5
+
+    def __init__(self, timeout_s: float | None = None) -> None:
+        self.timeout_s = timeout_s or settings.weather_timeout_s
+
+    @abstractmethod
+    async def _fetch(self, client: httpx.AsyncClient) -> tuple[list[WeatherReading], int, str]:
+        """Return (readings, http_status, endpoint). Raise on failure."""
+
+    async def fetch(self) -> ProviderOutcome:
+        """Fetch with bounded exponential-backoff retry."""
+        started = datetime.now(timezone.utc)
+        last_error: str | None = None
+        status: int | None = None
+        endpoint = ""
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self.timeout_s,
+                    headers={"User-Agent": USER_AGENT},
+                    follow_redirects=True,
+                ) as client:
+                    readings, status, endpoint = await self._fetch(client)
+                latency = (datetime.now(timezone.utc) - started).total_seconds() * 1000
+                log.info(
+                    "%s: %d readings in %.0f ms (attempt %d)",
+                    self.key, len(readings), latency, attempt,
+                )
+                return ProviderOutcome(
+                    provider_key=self.key,
+                    provider_label=self.label,
+                    ok=True,
+                    readings=readings,
+                    endpoint=endpoint,
+                    http_status=status,
+                    latency_ms=round(latency, 1),
+                    attempts=attempt,
+                )
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
+                log.warning("%s attempt %d/%d failed: %s",
+                            self.key, attempt, self.max_attempts, last_error)
+                if attempt < self.max_attempts:
+                    await asyncio.sleep(self.backoff_base_s ** attempt)
+
+        latency = (datetime.now(timezone.utc) - started).total_seconds() * 1000
+        return ProviderOutcome(
+            provider_key=self.key,
+            provider_label=self.label,
+            ok=False,
+            endpoint=endpoint,
+            http_status=status,
+            latency_ms=round(latency, 1),
+            attempts=self.max_attempts,
+            error=last_error,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 1. OGIMET / WMO SYNOP  -  Maitri, Indian Antarctic Programme
+# ---------------------------------------------------------------------------
+
+
+class OgimetSynopProvider(WeatherProvider):
+    """Real surface observations from an Indian Antarctic station.
+
+    Maitri transmits FM-12 SYNOP bulletins onto the WMO Global
+    Telecommunication System; OGIMET relays them verbatim. This is as close to
+    first-party Indian Antarctic observation data as is publicly retrievable.
+    """
+
+    key = "ogimet_synop"
+    label = "IMD/NCPOR Maitri (WMO 89514) - SYNOP via OGIMET"
+    priority = 10
+    supports_solar_radiation = False
+    #: Maitri reports at 00/06/12/18 UTC, so allow a generous window.
+    freshness_window_s = 8 * 3600
+
+    URL = "https://www.ogimet.com/cgi-bin/getsynop"
+
+    def __init__(self, wmo_index: str | None = None, lookback_h: int = 48,
+                 station_label: str | None = None, **kw) -> None:
+        super().__init__(**kw)
+        self.wmo_index = wmo_index or SITE.wmo_index
+        self.lookback_h = lookback_h
+        if station_label:
+            self.label = station_label
+
+    async def _fetch(self, client):
+        now = datetime.now(timezone.utc)
+        params = {
+            "block": self.wmo_index,
+            "begin": (now - timedelta(hours=self.lookback_h)).strftime("%Y%m%d%H%M"),
+            "end": now.strftime("%Y%m%d%H%M"),
+        }
+        resp = await client.get(self.URL, params=params)
+        resp.raise_for_status()
+        body = resp.text
+
+        if "wait" in body.lower()[:200] and "," not in body[:200]:
+            raise RuntimeError(f"OGIMET throttling response: {body[:120]!r}")
+
+        reports = parse_ogimet_csv(body)
+        if not reports:
+            raise RuntimeError(
+                f"No SYNOP bulletins decoded for WMO {self.wmo_index} "
+                f"in the last {self.lookback_h}h"
+            )
+
+        readings: list[WeatherReading] = []
+        for rp in reports:
+            if not rp.is_usable:
+                continue
+            readings.append(
+                WeatherReading(
+                    observed_at=rp.observed_at,
+                    provenance=DataProvenance.LIVE_OBSERVED,
+                    source=self.label,
+                    source_provider=self.key,
+                    source_station_code=self.wmo_index,
+                    temperature_c=rp.temperature_c,
+                    wind_speed_ms=rp.wind_speed_ms,
+                    wind_direction_deg=rp.wind_direction_deg,
+                    humidity_pct=rp.humidity_pct,
+                    pressure_hpa=rp.pressure_msl_hpa or rp.pressure_station_hpa,
+                    cloud_cover_pct=rp.cloud_cover_pct,
+                    snowfall_mm=rp.precipitation_mm,
+                    weather_text=rp.present_weather,
+                    # Antarctic blizzard criterion: blowing snow + strong wind
+                    is_blizzard=bool(
+                        rp.is_blowing_snow
+                        and (rp.wind_speed_ms or 0) >= 17.0
+                    ),
+                    solar_radiation_wm2=None,  # SYNOP carries no radiation group
+                    raw_payload={
+                        "raw_synop": rp.raw,
+                        "wmo_index": rp.station_index,
+                        "observed_at": rp.observed_at.isoformat(),
+                        "decoded_groups": rp.decoded_groups,
+                        "undecoded_groups": rp.undecoded_groups,
+                        "dewpoint_c": rp.dewpoint_c,
+                        "visibility_m": rp.visibility_m,
+                        "present_weather_code": rp.present_weather_code,
+                        "temp_max_c": rp.temp_max_c,
+                        "temp_min_c": rp.temp_min_c,
+                        "pressure_tendency_hpa": rp.pressure_tendency_hpa,
+                        "provider": self.key,
+                    },
+                )
+            )
+        if not readings:
+            raise RuntimeError("SYNOP bulletins decoded but none were usable")
+        return readings, resp.status_code, str(resp.url)
+
+
+# ---------------------------------------------------------------------------
+# 2. Open-Meteo  -  hourly resolution, solar radiation, forecast horizon
+# ---------------------------------------------------------------------------
+
+
+class OpenMeteoProvider(WeatherProvider):
+    """Real analysis + NWP forecast at the station's true coordinates.
+
+    Supplies the two things SYNOP cannot: hourly resolution and shortwave
+    radiation. Past/current hours are LIVE_OBSERVED, future hours are
+    REAL_FORECAST - the two are never conflated.
+    """
+
+    key = "open_meteo"
+    label = "Open-Meteo (ECMWF/GFS analysis + forecast)"
+    priority = 20
+    supports_solar_radiation = True
+    freshness_window_s = 2 * 3600
+
+    HOURLY = [
+        "temperature_2m", "apparent_temperature", "relative_humidity_2m",
+        "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m",
+        "shortwave_radiation", "direct_radiation", "diffuse_radiation",
+        "surface_pressure", "cloud_cover", "snowfall", "weather_code",
+    ]
+    CURRENT = [
+        "temperature_2m", "apparent_temperature", "relative_humidity_2m",
+        "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m",
+        "surface_pressure", "cloud_cover", "snowfall", "weather_code", "is_day",
+    ]
+
+    WMO_CODES = {
+        0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+        45: "Fog", 48: "Depositing rime fog", 51: "Light drizzle",
+        61: "Slight rain", 63: "Moderate rain", 71: "Slight snowfall",
+        73: "Moderate snowfall", 75: "Heavy snowfall", 77: "Snow grains",
+        85: "Slight snow showers", 86: "Heavy snow showers",
+    }
+
+    def __init__(self, latitude: float | None = None, longitude: float | None = None,
+                 past_days: int = 2, forecast_days: int = 7, **kw) -> None:
+        super().__init__(**kw)
+        self.latitude = latitude if latitude is not None else SITE.latitude
+        self.longitude = longitude if longitude is not None else SITE.longitude
+        self.past_days = past_days
+        self.forecast_days = forecast_days
+
+    async def _fetch(self, client):
+        params = {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "hourly": ",".join(self.HOURLY),
+            "current": ",".join(self.CURRENT),
+            "past_days": self.past_days,
+            "forecast_days": self.forecast_days,
+            "wind_speed_unit": "ms",
+            "timezone": "UTC",
+        }
+        resp = await client.get(settings.weather_forecast_url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        hourly = data.get("hourly") or {}
+        times = hourly.get("time") or []
+        if not times:
+            raise RuntimeError("Open-Meteo returned no hourly series")
+
+        now = datetime.now(timezone.utc)
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+
+        def col(name):
+            return hourly.get(name) or [None] * len(times)
+
+        cols = {n: col(n) for n in self.HOURLY}
+        readings: list[WeatherReading] = []
+
+        for i, tstr in enumerate(times):
+            try:
+                ts = datetime.fromisoformat(tstr).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            temp = cols["temperature_2m"][i]
+            wind = cols["wind_speed_10m"][i]
+            if temp is None or wind is None:
+                continue
+
+            provenance = (
+                DataProvenance.REAL_FORECAST if ts > current_hour
+                else DataProvenance.LIVE_OBSERVED
+            )
+            wcode = cols["weather_code"][i]
+            snow_cm = cols["snowfall"][i]
+            readings.append(
+                WeatherReading(
+                    observed_at=ts,
+                    provenance=provenance,
+                    source=self.label,
+                    source_provider=self.key,
+                    source_station_code=f"{self.latitude:.4f},{self.longitude:.4f}",
+                    temperature_c=temp,
+                    apparent_temperature_c=cols["apparent_temperature"][i],
+                    wind_speed_ms=wind,
+                    wind_gust_ms=cols["wind_gusts_10m"][i],
+                    wind_direction_deg=cols["wind_direction_10m"][i],
+                    solar_radiation_wm2=cols["shortwave_radiation"][i],
+                    direct_radiation_wm2=cols["direct_radiation"][i],
+                    diffuse_radiation_wm2=cols["diffuse_radiation"][i],
+                    humidity_pct=cols["relative_humidity_2m"][i],
+                    pressure_hpa=cols["surface_pressure"][i],
+                    cloud_cover_pct=cols["cloud_cover"][i],
+                    snowfall_mm=(snow_cm * 10.0) if snow_cm is not None else None,
+                    weather_text=self.WMO_CODES.get(wcode) if wcode is not None else None,
+                    is_blizzard=bool(wind >= 17.0 and (snow_cm or 0) > 0),
+                    raw_payload={
+                        "provider": self.key,
+                        "time": tstr,
+                        "latitude": data.get("latitude"),
+                        "longitude": data.get("longitude"),
+                        "elevation": data.get("elevation"),
+                        "units": data.get("hourly_units"),
+                        "values": {n: cols[n][i] for n in self.HOURLY},
+                    },
+                )
+            )
+
+        # The `current` block is a genuine sub-hourly nowcast; keep it as the
+        # freshest LIVE_OBSERVED point.
+        cur = data.get("current") or {}
+        if cur.get("temperature_2m") is not None and cur.get("wind_speed_10m") is not None:
+            try:
+                cts = datetime.fromisoformat(cur["time"]).replace(tzinfo=timezone.utc)
+            except (ValueError, KeyError):
+                cts = now
+            snow_cm = cur.get("snowfall")
+            # Radiation is not in the `current` block; borrow the matching hour.
+            rad = None
+            chour = cts.replace(minute=0, second=0, microsecond=0)
+            for r in readings:
+                if r.observed_at == chour:
+                    rad = r.solar_radiation_wm2
+                    break
+            readings.append(
+                WeatherReading(
+                    observed_at=cts.replace(second=0, microsecond=0),
+                    provenance=DataProvenance.LIVE_OBSERVED,
+                    source=self.label + " [current]",
+                    source_provider=self.key,
+                    source_station_code=f"{self.latitude:.4f},{self.longitude:.4f}",
+                    temperature_c=cur.get("temperature_2m"),
+                    apparent_temperature_c=cur.get("apparent_temperature"),
+                    wind_speed_ms=cur.get("wind_speed_10m"),
+                    wind_gust_ms=cur.get("wind_gusts_10m"),
+                    wind_direction_deg=cur.get("wind_direction_10m"),
+                    solar_radiation_wm2=rad,
+                    humidity_pct=cur.get("relative_humidity_2m"),
+                    pressure_hpa=cur.get("surface_pressure"),
+                    cloud_cover_pct=cur.get("cloud_cover"),
+                    snowfall_mm=(snow_cm * 10.0) if snow_cm is not None else None,
+                    weather_text=self.WMO_CODES.get(cur.get("weather_code")),
+                    is_blizzard=bool(
+                        (cur.get("wind_speed_10m") or 0) >= 17.0 and (snow_cm or 0) > 0
+                    ),
+                    raw_payload={"provider": self.key, "current": cur,
+                                 "units": data.get("current_units")},
+                )
+            )
+        return readings, resp.status_code, str(resp.url)
+
+
+class OpenMeteoArchiveProvider(OpenMeteoProvider):
+    """ERA5 reanalysis, used once to backfill real history for ML training."""
+
+    key = "open_meteo_archive"
+    label = "Open-Meteo ERA5 reanalysis archive"
+    priority = 90
+
+    ARCHIVE_HOURLY = [
+        "temperature_2m", "apparent_temperature", "relative_humidity_2m",
+        "wind_speed_10m", "wind_direction_10m",
+        "shortwave_radiation", "direct_radiation", "diffuse_radiation",
+        "surface_pressure", "cloud_cover", "snowfall",
+    ]
+
+    def __init__(self, start_date: str, end_date: str, **kw) -> None:
+        super().__init__(**kw)
+        self.start_date = start_date
+        self.end_date = end_date
+
+    async def _fetch(self, client):
+        params = {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "hourly": ",".join(self.ARCHIVE_HOURLY),
+            "wind_speed_unit": "ms",
+            "timezone": "UTC",
+        }
+        resp = await client.get(settings.weather_archive_url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        hourly = data.get("hourly") or {}
+        times = hourly.get("time") or []
+        if not times:
+            raise RuntimeError("Open-Meteo archive returned no hourly series")
+
+        cols = {n: (hourly.get(n) or [None] * len(times)) for n in self.ARCHIVE_HOURLY}
+        readings = []
+        for i, tstr in enumerate(times):
+            temp, wind = cols["temperature_2m"][i], cols["wind_speed_10m"][i]
+            if temp is None or wind is None:
+                continue
+            ts = datetime.fromisoformat(tstr).replace(tzinfo=timezone.utc)
+            snow_cm = cols["snowfall"][i]
+            readings.append(
+                WeatherReading(
+                    observed_at=ts,
+                    provenance=DataProvenance.REAL_OBSERVED,
+                    source=self.label,
+                    source_provider=self.key,
+                    source_station_code=f"{self.latitude:.4f},{self.longitude:.4f}",
+                    temperature_c=temp,
+                    apparent_temperature_c=cols["apparent_temperature"][i],
+                    wind_speed_ms=wind,
+                    wind_direction_deg=cols["wind_direction_10m"][i],
+                    solar_radiation_wm2=cols["shortwave_radiation"][i],
+                    direct_radiation_wm2=cols["direct_radiation"][i],
+                    diffuse_radiation_wm2=cols["diffuse_radiation"][i],
+                    humidity_pct=cols["relative_humidity_2m"][i],
+                    pressure_hpa=cols["surface_pressure"][i],
+                    cloud_cover_pct=cols["cloud_cover"][i],
+                    snowfall_mm=(snow_cm * 10.0) if snow_cm is not None else None,
+                    is_blizzard=bool(wind >= 17.0 and (snow_cm or 0) > 0),
+                    raw_payload={"provider": self.key, "time": tstr},
+                )
+            )
+        return readings, resp.status_code, str(resp.url)
+
+
+# ---------------------------------------------------------------------------
+# 3. NOAA Aviation Weather METAR
+# ---------------------------------------------------------------------------
+
+
+class NoaaMetarProvider(WeatherProvider):
+    """Real METAR observations from Antarctic aerodromes, hosted by NOAA."""
+
+    key = "noaa_metar"
+    label = "NOAA Aviation Weather Center - Antarctic METAR"
+    priority = 30
+    supports_solar_radiation = False
+    freshness_window_s = 4 * 3600
+
+    URL = "https://aviationweather.gov/api/data/metar"
+
+    def __init__(self, icao_ids: list[str] | None = None, hours: int = 12, **kw) -> None:
+        super().__init__(**kw)
+        self.icao_ids = icao_ids or ["NZSP"]
+        self.hours = hours
+
+    async def _fetch(self, client):
+        params = {"ids": ",".join(self.icao_ids), "format": "json", "hours": self.hours}
+        resp = await client.get(self.URL, params=params)
+        resp.raise_for_status()
+        try:
+            rows = resp.json()
+        except Exception as exc:
+            raise RuntimeError(f"METAR response was not JSON: {exc}") from exc
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError(f"No METAR rows for {self.icao_ids}")
+
+        readings = []
+        for row in rows:
+            temp = row.get("temp")
+            wspd_kt = row.get("wspd")
+            if temp is None or wspd_kt is None:
+                continue
+            try:
+                ts = datetime.fromisoformat(
+                    str(row["reportTime"]).replace("Z", "+00:00")
+                )
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except (ValueError, KeyError):
+                continue
+
+            dewp = row.get("dewp")
+            rh = (
+                round(relative_humidity(float(temp), float(dewp)), 1)
+                if dewp is not None else None
+            )
+            wx = (row.get("wxString") or "").upper()
+            wind_ms = round(float(wspd_kt) * KNOTS_TO_MS, 2)
+            cover = row.get("cover")
+            cover_pct = {"CLR": 0.0, "SKC": 0.0, "FEW": 18.0, "SCT": 44.0,
+                         "BKN": 75.0, "OVC": 100.0}.get(cover)
+
+            readings.append(
+                WeatherReading(
+                    observed_at=ts,
+                    provenance=DataProvenance.LIVE_OBSERVED,
+                    source=f"{self.label} [{row.get('icaoId')}]",
+                    source_provider=self.key,
+                    source_station_code=row.get("icaoId"),
+                    temperature_c=float(temp),
+                    wind_speed_ms=wind_ms,
+                    wind_direction_deg=(
+                        float(row["wdir"])
+                        if isinstance(row.get("wdir"), (int, float)) else None
+                    ),
+                    humidity_pct=rh,
+                    pressure_hpa=row.get("altim"),
+                    cloud_cover_pct=cover_pct,
+                    solar_radiation_wm2=None,  # METAR carries no radiation
+                    weather_text=row.get("wxString"),
+                    is_blizzard=bool(
+                        ("BLSN" in wx or "DRSN" in wx) and wind_ms >= 17.0
+                    ),
+                    raw_payload={"provider": self.key, "metar": row},
+                )
+            )
+        if not readings:
+            raise RuntimeError("METAR rows present but none usable")
+        return readings, resp.status_code, str(resp.url)
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+
+def default_providers() -> list[WeatherProvider]:
+    """The live chain used by the scheduled refresh, in priority order."""
+    return sorted(
+        [OgimetSynopProvider(), OpenMeteoProvider(), NoaaMetarProvider()],
+        key=lambda p: p.priority,
+    )
+
+
+PROVIDER_DESCRIPTIONS = {
+    OgimetSynopProvider.key: {
+        "label": OgimetSynopProvider.label,
+        "kind": "REAL station observation (WMO GTS)",
+        "station": "Maitri, Indian Antarctic Programme (WMO 89514)",
+        "cadence": "6-hourly synoptic (00/06/12/18 UTC)",
+        "variables": ["temperature", "wind speed", "wind direction", "pressure",
+                      "cloud cover", "visibility", "present weather"],
+        "missing": ["solar radiation", "humidity (Maitri omits the dewpoint group)"],
+        "authoritative": True,
+    },
+    OpenMeteoProvider.key: {
+        "label": OpenMeteoProvider.label,
+        "kind": "REAL analysis + NWP forecast at station coordinates",
+        "station": f"{SITE.latitude:.4f}, {SITE.longitude:.4f} (Maitri)",
+        "cadence": "hourly, updated continuously",
+        "variables": ["temperature", "wind", "solar radiation", "humidity",
+                      "pressure", "cloud cover", "snowfall"],
+        "missing": [],
+        "authoritative": False,
+    },
+    NoaaMetarProvider.key: {
+        "label": NoaaMetarProvider.label,
+        "kind": "REAL aerodrome observation",
+        "station": "Antarctic METAR stations (NZSP Amundsen-Scott)",
+        "cadence": "hourly to 6-hourly",
+        "variables": ["temperature", "wind", "pressure", "cloud", "present weather"],
+        "missing": ["solar radiation"],
+        "authoritative": False,
+    },
+}

@@ -1,0 +1,58 @@
+# =========================================================================
+# POLARIS - Render blueprint (backend API + managed PostgreSQL)
+#
+#   Render dashboard -> New -> Blueprint -> point at this repository.
+#
+# The frontend deploys separately on Vercel (see frontend/vercel.json); only
+# CORS_ORIGINS below has to be updated once its URL is known.
+# =========================================================================
+
+databases:
+  - name: polaris-db
+    databaseName: polaris
+    user: polaris
+    plan: free
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: polaris-api
+    runtime: python
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    # $PORT is injected by Render.
+    startCommand: >-
+      python -m scripts.init_db &&
+      uvicorn app.main:app --host 0.0.0.0 --port $PORT
+      --proxy-headers --forwarded-allow-ips='*'
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: ENABLE_DOCS
+        value: "true"
+      # Wired automatically from the managed database above.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: polaris-db
+          property: connectionString
+      # ==> SET THIS to the deployed Vercel origin after the frontend is up.
+      #     In production there is no localhost wildcard, so an unset value
+      #     means the browser will be refused by CORS.
+      - key: CORS_ORIGINS
+        sync: false
+      - key: ALLOW_NETWORK_INGEST
+        value: "true"
+      - key: HISTORY_DAYS
+        value: "120"
+      - key: FORECAST_HORIZON_H
+        value: "168"
+      - key: WEATHER_TIMEOUT_S
+        value: "25"
