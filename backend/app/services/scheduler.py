@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from app.database.session import SessionLocal
-from app.services.pipeline import run_pipeline
+from app.services.pipeline import backfill_history_if_needed, run_pipeline
 from app.services.weather.ingest import run_ingestion
 
 log = logging.getLogger("polaris.scheduler")
@@ -76,6 +76,15 @@ async def refresh_once(trigger: str = "scheduled", run_ai: bool = True) -> dict:
 
         db = SessionLocal()
         try:
+            # Self-heal a thin history store. No-op once enough real history
+            # exists; retries if an earlier attempt was rate-limited.
+            try:
+                topped_up = await backfill_history_if_needed(db)
+                if topped_up:
+                    out["backfill"] = {"observations_written": topped_up}
+            except Exception as exc:
+                log.warning("History top-up skipped: %s", exc)
+
             ingest = await run_ingestion(db, trigger=trigger)
             out["ingestion"] = ingest.as_dict()
 

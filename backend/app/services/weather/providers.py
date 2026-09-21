@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -117,6 +118,13 @@ class WeatherProvider(ABC):
     freshness_window_s: int = 3600
     max_attempts: int = 3
     backoff_base_s: float = 1.5
+    #: Rate limits need a far longer wait than a transient network blip, and
+    #: they are worth more attempts. This matters on shared-IP hosting (free
+    #: PaaS tiers), where another tenant can exhaust a per-IP quota that this
+    #: application never comes close to on its own.
+    rate_limit_attempts: int = 5
+    rate_limit_backoff_s: tuple[float, ...] = (5.0, 15.0, 45.0, 90.0)
+    max_retry_after_s: float = 120.0
 
     def __init__(self, timeout_s: float | None = None) -> None:
         self.timeout_s = timeout_s or settings.weather_timeout_s
@@ -125,14 +133,36 @@ class WeatherProvider(ABC):
     async def _fetch(self, client: httpx.AsyncClient) -> tuple[list[WeatherReading], int, str]:
         """Return (readings, http_status, endpoint). Raise on failure."""
 
+    @staticmethod
+    def _retry_after_seconds(exc: httpx.HTTPStatusError) -> float | None:
+        """Honour a server-supplied Retry-After, when it gives one."""
+        raw = exc.response.headers.get("retry-after")
+        if not raw:
+            return None
+        try:
+            return float(raw)  # delta-seconds form
+        except ValueError:
+            try:  # HTTP-date form
+                from email.utils import parsedate_to_datetime
+
+                when = parsedate_to_datetime(raw)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+            except Exception:
+                return None
+
     async def fetch(self) -> ProviderOutcome:
-        """Fetch with bounded exponential-backoff retry."""
+        """Fetch with bounded retry, backing off hard on a rate limit."""
         started = datetime.now(timezone.utc)
         last_error: str | None = None
         status: int | None = None
         endpoint = ""
 
-        for attempt in range(1, self.max_attempts + 1):
+        attempt = 0
+        max_attempts = self.max_attempts
+        while attempt < max_attempts:
+            attempt += 1
             try:
                 async with httpx.AsyncClient(
                     timeout=self.timeout_s,
@@ -157,12 +187,33 @@ class WeatherProvider(ABC):
                 )
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                rate_limited = False
                 if isinstance(exc, httpx.HTTPStatusError):
                     status = exc.response.status_code
-                log.warning("%s attempt %d/%d failed: %s",
-                            self.key, attempt, self.max_attempts, last_error)
-                if attempt < self.max_attempts:
-                    await asyncio.sleep(self.backoff_base_s ** attempt)
+                    rate_limited = status == 429
+
+                if rate_limited:
+                    # Allow more attempts and much longer waits than a plain
+                    # network error deserves.
+                    max_attempts = max(max_attempts, self.rate_limit_attempts)
+                    idx = min(attempt - 1, len(self.rate_limit_backoff_s) - 1)
+                    delay = self.rate_limit_backoff_s[idx]
+                    server_hint = self._retry_after_seconds(exc)
+                    if server_hint is not None:
+                        delay = min(max(server_hint, 1.0), self.max_retry_after_s)
+                    log.warning(
+                        "%s rate-limited (429) on attempt %d/%d; waiting %.0fs. "
+                        "On shared-IP hosting this quota can be consumed by "
+                        "other tenants.", self.key, attempt, max_attempts, delay,
+                    )
+                else:
+                    delay = self.backoff_base_s ** attempt
+                    log.warning("%s attempt %d/%d failed: %s",
+                                self.key, attempt, max_attempts, last_error)
+
+                if attempt < max_attempts:
+                    # Jitter so concurrent retries do not synchronise.
+                    await asyncio.sleep(delay * (0.8 + 0.4 * random.random()))
 
         latency = (datetime.now(timezone.utc) - started).total_seconds() * 1000
         return ProviderOutcome(
