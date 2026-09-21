@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import {
   Activity, AlertTriangle, BrainCircuit, Cloud, Compass,
   Database, Gauge, LayoutDashboard, Menu, RefreshCw, Settings, ShieldAlert,
-  Sliders, Sun, Timer,
+  ShieldCheck, Sliders, Sun, Timer,
 } from 'lucide-react'
 import { usePolaris } from '../hooks/usePolaris'
 import { LivePill } from '../components/Primitives'
@@ -168,6 +168,24 @@ export default function AppLayout() {
         <main>
           <Outlet />
         </main>
+
+        {/* The system's purpose statement. Driven by live state rather than
+            hardcoded, so it reads as a status line and not a slogan. */}
+        <footer className="system-footer">
+          <div className="sf-left">
+            <ShieldCheck size={14} />
+            <span className="sf-msg">SAFE &amp; EFFICIENT POLAR STATION OPERATION</span>
+          </div>
+          <div className="sf-right">
+            <span className={`sf-chip ${liveStatus === 'LIVE' ? 'ok' : 'warn'}`}>
+              {liveStatus === 'LIVE' ? 'Real weather linked' : 'Weather source stale'}
+            </span>
+            <span className="sf-sep">·</span>
+            <span>{station?.station_name || 'Maitri Research Station'}</span>
+            <span className="sf-sep">·</span>
+            <span>{banners?.data_banner || 'REAL WEATHER DATA + RESEARCH-BASED ENERGY MODEL'}</span>
+          </div>
+        </footer>
       </div>
     </div>
   )

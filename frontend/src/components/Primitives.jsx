@@ -65,7 +65,9 @@ export function LivePill({ status, ageSeconds, compact = false }) {
       <span className="live-dot" />
       {label}
       {!compact && ageSeconds != null && status !== 'LOADING' && (
-        <span style={{ fontWeight: 500, opacity: 0.8 }}>· {ago(ageSeconds)}</span>
+        <span className="pill-age" style={{ fontWeight: 500, opacity: 0.8 }}>
+          · {ago(ageSeconds)}
+        </span>
       )}
     </span>
   )
