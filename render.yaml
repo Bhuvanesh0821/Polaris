@@ -23,8 +23,16 @@ services:
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     # $PORT is injected by Render.
+    #
+    # bootstrap is idempotent: on the FIRST boot it backfills ~90 days of real
+    # ERA5 history and runs the AI pipeline once, so the dashboard has data
+    # immediately. On every later restart - including a free-tier wake from
+    # sleep - it finds the history already present and skips in milliseconds.
+    # `|| true` means a transient provider outage degrades to a slower first
+    # load rather than a boot loop.
     startCommand: >-
       python -m scripts.init_db &&
+      (python -m scripts.bootstrap --days 90 || true) &&
       uvicorn app.main:app --host 0.0.0.0 --port $PORT
       --proxy-headers --forwarded-allow-ips='*'
     healthCheckPath: /api/health
