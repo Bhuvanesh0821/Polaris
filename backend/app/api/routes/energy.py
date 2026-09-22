@@ -45,6 +45,13 @@ _NO_DATA = (
     "live weather refresh - call POST /api/weather/refresh."
 )
 
+_NO_FORECAST = (
+    "No forecast available. A forecast requires forward-looking weather from "
+    "the NWP provider, which is currently unreachable. POLARIS does not "
+    "substitute past observations for a forecast. Live conditions, modelled "
+    "energy state and survival analysis remain available and are unaffected."
+)
+
 
 @router.get("/energy/status", response_model=Envelope[EnergyStatusOut])
 def energy_status(db: Session = Depends(get_db)):
@@ -153,7 +160,7 @@ def load_forecast(
         .limit(hours)
     ))
     if not rows:
-        raise HTTPException(status_code=404, detail=_NO_DATA)
+        raise HTTPException(status_code=404, detail=_NO_FORECAST)
 
     return Envelope(
         data=[
@@ -190,7 +197,7 @@ def renewable_forecast(
         .limit(hours)
     ))
     if not rows:
-        raise HTTPException(status_code=404, detail=_NO_DATA)
+        raise HTTPException(status_code=404, detail=_NO_FORECAST)
 
     return Envelope(
         data=[

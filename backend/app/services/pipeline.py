@@ -220,6 +220,87 @@ def anchor_energy_state() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _clear_stale_forecasts(db: Session, station_id: int) -> None:
+    """Remove forecasts we can no longer stand behind.
+
+    Leaving an old horizon in place would let the dashboard keep showing a
+    forecast long after the source that justified it went away.
+    """
+    db.execute(delete(EnergyForecast).where(EnergyForecast.station_id == station_id))
+    db.execute(delete(RenewableForecast).where(RenewableForecast.station_id == station_id))
+    db.flush()
+
+
+def _finish_without_forecast(db: Session, station, started: datetime,
+                             result: "PipelineResult") -> "PipelineResult":
+    """Run the present-state chain when no forecast horizon exists.
+
+    Current state, survival and risk depend only on observed weather and the
+    modelled plant, so they remain valid and useful even with the NWP
+    provider down.
+    """
+    try:
+        full = load_weather_frame(db, station.id, days=settings.history_days,
+                                  include_forecast=False)
+        now_hour = started.replace(minute=0, second=0, microsecond=0)
+        recent = full[full["observed_at"] < now_hour].tail(72).copy()
+        if recent.empty:
+            recent = full.tail(24).copy()
+        if recent.empty:
+            result.error = "No observations available for state estimation."
+            return result
+
+        state0 = anchor_energy_state()
+        sim = EnergyStateEstimator().run(
+            recent, initial_soc_pct=state0["soc_pct"],
+            initial_fuel_l=state0["fuel_l"],
+        )
+        if not sim.states:
+            result.error = "State estimation produced no states."
+            return result
+
+        current = sim.states[-1]
+        _persist_energy_state(db, station.id, sim, recent)
+        result.stages["state_estimation"] = {
+            "ok": True, "hours_simulated": len(sim.states),
+            "final_soc_pct": sim.final_soc_pct, "final_fuel_l": sim.final_fuel_l,
+        }
+
+        autonomy = estimate_autonomy(
+            critical_demand_kw=current.critical_load_kw,
+            soc_pct=current.battery_soc_pct, fuel_l=current.fuel_level_l,
+            ambient_c=current.temperature_c, renewable_kw=current.renewable_kw,
+        )
+        autonomy_dict = {
+            "hours": None if autonomy.hours == float("inf") else autonomy.hours,
+            "limited_by": autonomy.limited_by,
+            "critical_demand_kw": autonomy.critical_demand_kw,
+            "renewable_contribution_kw": autonomy.renewable_contribution_kw,
+        }
+        result.stages["survival"] = autonomy_dict
+
+        recs, alerts = rec_engine.generate(
+            state=current.as_dict(), autonomy=autonomy_dict, optimization=None,
+            forecast_summary=None,
+            weather={"temperature_c": current.temperature_c,
+                     "wind_speed_ms": current.wind_speed_ms},
+        )
+        _persist_recommendations(db, station.id, started, recs)
+        _persist_alerts(db, station.id, started, alerts)
+        result.recommendations = len(recs)
+        result.alerts = len(alerts)
+        result.stages["recommendations"] = {"ok": True, "count": len(recs)}
+
+        db.commit()
+        result.ok = True
+    except Exception as exc:
+        db.rollback()
+        result.error = f"{type(exc).__name__}: {exc}"
+        log.exception("Present-state pipeline failed")
+    result.duration_ms = (datetime.now(timezone.utc) - started).total_seconds() * 1000
+    return result
+
+
 def run_pipeline(db: Session, trigger: str = "scheduled",
                  horizon_h: int | None = None,
                  retrain: bool = False) -> PipelineResult:
@@ -258,8 +339,30 @@ def run_pipeline(db: Session, trigger: str = "scheduled",
                                   include_forecast=True)
         now_hour = started.replace(minute=0, second=0, microsecond=0)
         future = full[full["observed_at"] >= now_hour].head(horizon_h).copy()
+
+        # A forecast REQUIRES genuine forward-looking weather. If the NWP
+        # provider is unreachable there is none, and replaying past
+        # observations as though they were a forecast would be exactly the
+        # kind of dishonesty this project exists to avoid. Skip the forecast
+        # and say why, rather than inventing one.
         if future.empty:
-            future = full.tail(min(horizon_h, len(full))).copy()
+            reason = (
+                "No forward-looking weather available: the NWP forecast "
+                "provider returned no future hours. POLARIS does not "
+                "substitute past observations for a forecast, so the "
+                "forecast and optimiser stages were skipped."
+            )
+            log.warning(reason)
+            _clear_stale_forecasts(db, station.id)
+            result.stages["forecasting"] = {
+                "ok": False, "rows": 0, "mode": "UNAVAILABLE", "reason": reason,
+            }
+            result.stages["optimization"] = {
+                "ok": False, "reason": "Requires a forecast horizon.",
+            }
+            # The present-state chain does not depend on a forecast, so it
+            # still runs: state estimation, survival, alerts, recommendations.
+            return _finish_without_forecast(db, station, started, result)
 
         if registry.is_trained and not future.empty:
             load_fc = registry.load_forecaster.predict(future)
