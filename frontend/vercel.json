@@ -5,11 +5,7 @@
   "outputDirectory": "dist",
   "installCommand": "npm ci",
   "rewrites": [
-    {
-      "//": "SPA fallback. React Router owns the URL space, so a hard refresh on /crisis or /survival must still serve index.html instead of 404.",
-      "source": "/((?!assets/).*)",
-      "destination": "/index.html"
-    }
+    { "source": "/((?!assets/).*)", "destination": "/index.html" }
   ],
   "headers": [
     {
