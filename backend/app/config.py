@@ -117,7 +117,28 @@ class Settings(BaseSettings):
         return r"http://(localhost|127\.0\.0\.1):\d+"
 
     def safe_dsn(self) -> str:
-        """DSN with the password masked - safe to log or return from /health."""
+        """DSN with the password masked - safe to log or return from /health.
+
+        Reports the connection ACTUALLY in use. A managed provider supplies a
+        single DATABASE_URL, and building this string from the discrete
+        POSTGRES_* variables instead would report "localhost" on a deployment
+        that is really talking to a remote database - a misleading answer from
+        the one endpoint operators use to diagnose connectivity.
+        """
+        if self.database_url_override:
+            from urllib.parse import urlsplit, urlunsplit
+
+            parts = urlsplit(self.database_url_override)
+            if parts.password:
+                user = parts.username or ""
+                host = parts.hostname or ""
+                port = f":{parts.port}" if parts.port else ""
+                netloc = f"{user}:***@{host}{port}"
+                return urlunsplit(
+                    (parts.scheme, netloc, parts.path, "", "")
+                )
+            return self.database_url_override
+
         return (
             f"postgresql://{self.postgres_user}:***@{self.postgres_host}"
             f":{self.postgres_port}/{self.postgres_db}"
