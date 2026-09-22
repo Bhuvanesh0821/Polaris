@@ -157,27 +157,42 @@ def test_dashboard_carries_three_autonomy_modes(client):
 
 # ------------------------------------------------------------ forecasts ---
 
+def _forecast_or_skip(client, path, hours):
+    """Fetch a forecast, or skip when none is legitimately available.
+
+    A 404 here is a valid, honest state: it means the NWP provider is
+    unreachable and POLARIS refused to invent a forecast. These tests check
+    the SHAPE of a forecast, so they have nothing to assert in that case.
+    test_forecast_rows_are_genuinely_in_the_future covers the 404 path.
+    """
+    r = client.get(path, params={"hours": hours})
+    if r.status_code == 404:
+        pytest.skip("no forecast available (NWP provider unreachable)")
+    assert r.status_code == 200
+    return r.json()
+
+
 @pytest.mark.parametrize("hours", [6, 24, 48])
 def test_forecast_horizons(client, hours):
-    load = client.get("/load/forecast", params={"hours": hours}).json()["data"]
-    renew = client.get("/renewable/forecast", params={"hours": hours}).json()["data"]
+    load = _forecast_or_skip(client, "/load/forecast", hours)["data"]
+    renew = _forecast_or_skip(client, "/renewable/forecast", hours)["data"]
     assert len(load) == hours
     assert len(renew) == hours
 
 
 def test_seven_day_forecast_is_available(client):
-    d = client.get("/load/forecast", params={"hours": 168}).json()["data"]
+    d = _forecast_or_skip(client, "/load/forecast", 168)["data"]
     # NWP providers cap out around 6-7 days; anything past 5 days is enough
     assert len(d) > 120
 
 
 def test_forecast_is_labelled_ai(client):
-    env = client.get("/load/forecast", params={"hours": 6}).json()
+    env = _forecast_or_skip(client, "/load/forecast", 6)
     assert env["provenance"]["data_class"] == "AI_FORECAST"
 
 
 def test_renewable_forecast_splits_wind_and_solar(client):
-    rows = client.get("/renewable/forecast", params={"hours": 24}).json()["data"]
+    rows = _forecast_or_skip(client, "/renewable/forecast", 24)["data"]
     for r in rows:
         assert r["total_kw"] == pytest.approx(r["wind_kw"] + r["solar_kw"], abs=0.05)
 
@@ -209,3 +224,55 @@ def test_validation_rejects_bad_input(client):
     assert client.post("/optimization/run",
                        json={"horizon_h": 9999}).status_code == 422
     assert client.get("/alerts", params={"status": "BOGUS"}).status_code == 422
+
+
+# ------------------------------------------------ forecast honesty --------
+
+def test_forecast_rows_are_genuinely_in_the_future(client):
+    """A forecast must never be past weather relabelled.
+
+    Regression guard. When the NWP provider was rate-limited in production,
+    the pipeline silently fell back to replaying observed history and served
+    it as a 7-day forecast - every target_time was in the past. POLARIS must
+    return no forecast at all rather than a dishonest one.
+    """
+    import datetime as _dt
+
+    r = client.get("/load/forecast", params={"hours": 48})
+    if r.status_code == 404:
+        # Honest unavailability is an acceptable outcome; the message must
+        # explain why rather than pretending the data is merely missing.
+        assert "forward-looking" in r.json()["detail"].lower()
+        return
+
+    rows = r.json()["data"]
+    assert rows
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff = now - _dt.timedelta(hours=2)   # allow the current hour to count
+    stale = [
+        x["target_time"] for x in rows
+        if _dt.datetime.fromisoformat(
+            x["target_time"].replace("Z", "+00:00")) < cutoff
+    ]
+    assert not stale, (
+        f"{len(stale)}/{len(rows)} forecast rows are in the past - "
+        f"past weather is being presented as a forecast (first: {stale[:1]})"
+    )
+
+
+def test_renewable_forecast_is_also_forward_looking(client):
+    import datetime as _dt
+
+    r = client.get("/renewable/forecast", params={"hours": 24})
+    if r.status_code == 404:
+        assert "forward-looking" in r.json()["detail"].lower()
+        return
+    rows = r.json()["data"]
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff = now - _dt.timedelta(hours=2)
+    stale = [
+        x for x in rows
+        if _dt.datetime.fromisoformat(
+            x["target_time"].replace("Z", "+00:00")) < cutoff
+    ]
+    assert not stale, f"{len(stale)}/{len(rows)} renewable forecast rows are stale"
