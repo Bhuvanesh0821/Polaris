@@ -21,6 +21,23 @@ def client(api_base, api_up):
 
 # -------------------------------------------------------------- health ----
 
+def test_ping_is_live(client):
+    r = client.get("/ping")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_ping_never_touches_the_database():
+    """Render and UptimeRobot probe /ping continuously. If it took a DB
+    session, a scale-to-zero database could never suspend."""
+    import inspect
+
+    from app.api.routes.system import ping_liveness
+
+    assert not inspect.signature(ping_liveness).parameters
+    assert "db" not in inspect.getsource(ping_liveness).split('"""')[-1]
+
+
 def test_health_reports_database_connected(client):
     r = client.get("/health")
     assert r.status_code == 200

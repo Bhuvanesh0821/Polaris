@@ -51,6 +51,19 @@ log = logging.getLogger("polaris.api.system")
 router = APIRouter(tags=["system"])
 
 
+@router.get("/ping")
+def ping_liveness():
+    """Process liveness only - deliberately touches NO database.
+
+    Point platform health checks and uptime monitors here, not at /health.
+    Render probes every few seconds; if that probe queried PostgreSQL, a
+    scale-to-zero database (Neon free tier) could never suspend and would
+    exhaust its monthly compute allowance. /health remains the full
+    readiness report for humans and diagnostics.
+    """
+    return {"status": "ok", "app": settings.app_name}
+
+
 @router.get("/health", response_model=HealthResponse)
 def health(db: Session = Depends(get_db)):
     """Liveness + readiness. Never raises - it is the probe of last resort."""

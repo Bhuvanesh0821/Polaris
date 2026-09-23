@@ -65,6 +65,12 @@ class Settings(BaseSettings):
     #: NOT fall back to generated weather.
     allow_network_ingest: bool = True
 
+    #: Seconds between scheduled ingest + pipeline cycles. Maitri reports on
+    #: the 3-6 h synoptic cycle and the NWP forecast updates hourly, so 30 min
+    #: loses no information - and it lets a scale-to-zero database (Neon free
+    #: tier) sleep between cycles instead of staying awake around the clock.
+    refresh_interval_s: int = 1800
+
     # --- Model / simulation ---
     #: days of real weather history loaded for training and state estimation
     history_days: int = 120

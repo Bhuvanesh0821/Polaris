@@ -22,7 +22,7 @@ log = logging.getLogger("polaris.scheduler")
 @dataclass
 class SchedulerState:
     running: bool = False
-    interval_s: int = 900  # 15 minutes
+    interval_s: int = 1800  # set from settings.refresh_interval_s at start()
     started_at: datetime | None = None
     last_run_at: datetime | None = None
     last_success_at: datetime | None = None
@@ -145,7 +145,7 @@ async def _loop() -> None:
             log.exception("Unhandled scheduler error")
 
         # Back off when a source is persistently down, so a dead provider is
-        # not hammered every 15 minutes.
+        # not hammered on every cycle.
         delay = state.interval_s
         if state.consecutive_failures > 2:
             delay = min(state.interval_s * 4, 3600)

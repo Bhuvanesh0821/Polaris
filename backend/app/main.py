@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
 
     from app.services import scheduler
 
-    scheduler.start()
+    scheduler.start(settings.refresh_interval_s)
     log.info("Background refresh scheduler started (%ds interval)",
              scheduler.state.interval_s)
 

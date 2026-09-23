@@ -74,3 +74,28 @@ def test_production_disables_the_localhost_cors_wildcard(monkeypatch):
 def test_cors_origins_parse_into_a_list(monkeypatch):
     s = _settings(monkeypatch, CORS_ORIGINS="https://a.example, https://b.example")
     assert s.cors_origin_list == ["https://a.example", "https://b.example"]
+
+
+NEON = ("postgresql://neondb_owner:n3onS3cret@ep-cool-name-a1b2c3d4"
+        ".us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+
+
+def test_neon_url_keeps_its_tls_parameters(monkeypatch):
+    """Neon refuses unencrypted connections; dropping sslmode or
+    channel_binding while normalising the driver would break the deploy."""
+    s = _settings(monkeypatch, DATABASE_URL=NEON)
+    assert s.sqlalchemy_url.startswith("postgresql+psycopg://")
+    assert "sslmode=require" in s.sqlalchemy_url
+    assert "channel_binding=require" in s.sqlalchemy_url
+    dsn = s.safe_dsn()
+    assert "n3onS3cret" not in dsn
+    assert "neon.tech" in dsn
+
+
+def test_refresh_interval_lets_a_scale_to_zero_database_sleep(monkeypatch):
+    """Neon suspends after 5 idle minutes. The refresh cycle must leave most
+    of each interval idle, or the free compute allowance runs out mid-month."""
+    monkeypatch.delenv("REFRESH_INTERVAL_S", raising=False)
+    import app.config as cfg
+    importlib.reload(cfg)
+    assert cfg.Settings(_env_file=None).refresh_interval_s >= 1800
