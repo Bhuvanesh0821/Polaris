@@ -1,18 +1,15 @@
 # =========================================================================
-# POLARIS - Render blueprint (backend API + managed PostgreSQL)
+# POLARIS - Render blueprint (backend API)
 #
 #   Render dashboard -> New -> Blueprint -> point at this repository.
+#
+# PostgreSQL is hosted on Neon, not Render: Render's free databases are
+# deleted 30 days after creation, Neon's free tier does not expire. Set
+# DATABASE_URL below to the Neon connection string.
 #
 # The frontend deploys separately on Vercel (see frontend/vercel.json); only
 # CORS_ORIGINS below has to be updated once its URL is known.
 # =========================================================================
-
-databases:
-  - name: polaris-db
-    databaseName: polaris
-    user: polaris
-    plan: free
-    postgresMajorVersion: "16"
 
 services:
   - type: web
@@ -35,7 +32,9 @@ services:
       (python -m scripts.bootstrap --days 90 || true) &&
       uvicorn app.main:app --host 0.0.0.0 --port $PORT
       --proxy-headers --forwarded-allow-ips='*'
-    healthCheckPath: /api/health
+    # /api/ping never touches the database. Render probes every few seconds;
+    # probing /api/health would keep a scale-to-zero database awake 24/7.
+    healthCheckPath: /api/ping
     autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
@@ -46,11 +45,12 @@ services:
         value: "false"
       - key: ENABLE_DOCS
         value: "true"
-      # Wired automatically from the managed database above.
+      # ==> SET THIS to the Neon connection string (Dashboard -> Connect).
+      #     Use the DIRECT host, not the "-pooler" one, and keep
+      #     ?sslmode=require. It is a secret: set it in the Render dashboard,
+      #     never in this file.
       - key: DATABASE_URL
-        fromDatabase:
-          name: polaris-db
-          property: connectionString
+        sync: false
       # ==> SET THIS to the deployed Vercel origin after the frontend is up.
       #     In production there is no localhost wildcard, so an unset value
       #     means the browser will be refused by CORS.
@@ -64,3 +64,5 @@ services:
         value: "168"
       - key: WEATHER_TIMEOUT_S
         value: "25"
+      - key: REFRESH_INTERVAL_S
+        value: "1800"
