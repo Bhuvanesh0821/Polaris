@@ -74,16 +74,22 @@ def summer_frame() -> pd.DataFrame:
 
 @pytest.fixture(scope="session")
 def api_base() -> str:
-    return "http://127.0.0.1:8000/api"
+    import os
+
+    return os.environ.get("POLARIS_API_BASE", "http://127.0.0.1:8000/api")
 
 
 @pytest.fixture(scope="session")
 def api_up(api_base: str) -> bool:
-    """True when a live backend is reachable; API tests skip if not."""
+    """True when a live POLARIS backend is reachable; API tests skip if not.
+
+    Checks identity, not just a 200: another local project on the same port
+    would otherwise have the whole API suite run against the wrong app.
+    """
     import httpx
 
     try:
-        r = httpx.get(f"{api_base}/health", timeout=5.0)
-        return r.status_code == 200
+        r = httpx.get(f"{api_base}/ping", timeout=5.0)
+        return r.status_code == 200 and r.json().get("app") == "POLARIS"
     except Exception:
         return False

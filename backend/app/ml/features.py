@@ -98,10 +98,21 @@ def build_features(df: pd.DataFrame, timestamp_col: str = "observed_at") -> pd.D
     )
 
     # Clear-sky index: how much of the theoretical maximum actually arrived.
-    from app.core.physics import clear_sky_ghi
+    from app.core.physics import clear_sky_ghi, ghi_from_cloud_cover
 
     cs = np.array([clear_sky_ghi(p) for p in positions])
-    ghi = out["solar_radiation_wm2"].fillna(0.0).to_numpy(dtype=float)
+    # A source that reports no radiation (a SYNOP bulletin, the MET Norway
+    # forecast) must not read as "zero sunlight" - in daylight that would
+    # tell the models the sky is black. Estimate it from cloud cover exactly
+    # as the physics baseline does, and flag the estimate.
+    missing = out["solar_radiation_wm2"].isna().to_numpy()
+    out["solar_radiation_estimated"] = missing
+    if missing.any():
+        cloud = out["cloud_cover_pct"].to_numpy(dtype=float)
+        est = [ghi_from_cloud_cover(p, None if np.isnan(c) else float(c))
+               for p, c in zip(positions, cloud)]
+        out.loc[missing, "solar_radiation_wm2"] = np.asarray(est)[missing]
+    ghi = out["solar_radiation_wm2"].to_numpy(dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
         csi = np.where(cs > 5.0, ghi / cs, 0.0)
     out["clear_sky_index"] = np.clip(csi, 0.0, 1.3)

@@ -144,8 +144,8 @@ class IngestReport:
 # ---------------------------------------------------------------------------
 
 #: Ranking used when two providers report the same hour. Lower wins.
-PROVIDER_RANK = {"ogimet_synop": 0, "open_meteo": 1, "noaa_metar": 2,
-                 "open_meteo_archive": 3}
+PROVIDER_RANK = {"ogimet_synop": 0, "open_meteo": 1, "met_norway": 2,
+                 "noaa_metar": 3, "open_meteo_archive": 4}
 
 
 def _enrich(reading: WeatherReading) -> dict[str, Any]:
@@ -416,9 +416,17 @@ def build_current_conditions(db: Session, station_id: int,
     ))
 
     if not rows:
+        # The newest row overall is usually a FORECAST hour days ahead; it
+        # must never stand in for "the last observation".
         last = db.scalar(
             select(WeatherObservation)
-            .where(WeatherObservation.station_id == station_id)
+            .where(
+                WeatherObservation.station_id == station_id,
+                WeatherObservation.observed_at <= now,
+                WeatherObservation.provenance.in_(
+                    [DataProvenance.LIVE_OBSERVED, DataProvenance.REAL_OBSERVED]
+                ),
+            )
             .order_by(WeatherObservation.observed_at.desc())
             .limit(1)
         )
