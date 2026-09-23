@@ -202,7 +202,7 @@ SAFE & EFFICIENT POLAR STATION OPERATION
 
 ### The live loop
 
-Every 15 minutes (and on the **Refresh** button), the backend runs:
+Every 30 minutes (and on the **Refresh** button), the backend runs:
 
 ```
 live weather  ->  preprocess  ->  features  ->  AI forecast
@@ -263,6 +263,7 @@ polaris/
 
 | Method | Endpoint | Data class |
 |---|---|---|
+| GET | `/api/ping` | — (liveness, no database) |
 | GET | `/api/health` | — |
 | GET | `/api/weather` | REAL LIVE |
 | GET | `/api/weather/current` | REAL LIVE |

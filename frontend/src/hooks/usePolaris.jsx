@@ -72,7 +72,10 @@ export function PolarisProvider({ children }) {
 
   useEffect(() => {
     if (!autoPoll) return undefined
-    const id = setInterval(() => load({ silent: true }), pollMs)
+    // Skip polls while the tab is hidden: a forgotten background tab would
+    // otherwise keep the database awake indefinitely. The visibility handler
+    // below catches up the moment the operator returns.
+    const id = setInterval(() => { if (!document.hidden) load({ silent: true }) }, pollMs)
     return () => clearInterval(id)
   }, [autoPoll, pollMs, load])
 

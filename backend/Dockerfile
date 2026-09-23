@@ -52,7 +52,7 @@ USER polaris
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
-  CMD curl -fsS http://localhost:8000/api/health || exit 1
+  CMD curl -fsS http://localhost:8000/api/ping || exit 1
 
 # $PORT is respected so the same image runs unchanged on Render/Railway,
 # which inject the port at run time.
