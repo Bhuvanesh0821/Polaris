@@ -49,6 +49,7 @@ System, which are publicly retrievable in near real time.
 |---|---|---|---|---|
 | 10 | **IMD/NCPOR Maitri SYNOP** via OGIMET (WMO 89514) | Authoritative station observation | 6-hourly (00/06/12/18 UTC) | Decoded by a purpose-built FM-12 SYNOP parser. Carries **no** radiation group and Maitri omits the dewpoint group. |
 | 20 | **Open-Meteo** (ECMWF/GFS) at Maitri's coordinates | Hourly resolution, solar radiation, forecast horizon | hourly | Supplies the two things SYNOP cannot. |
+| 25 | **MET Norway Locationforecast** at Maitri's coordinates | Independent forecast failover | hourly to ~60 h, then 6-hourly | Keeps the forecast alive when Open-Meteo is rate-limited. The 6-hourly tail is interpolated to hourly (flagged); no radiation, so solar is estimated from cloud cover. |
 | 30 | **NOAA Aviation Weather METAR** (NZSP Amundsen-Scott) | Independent failover + regional reference | hourly–6-hourly | Real aerodrome observations. |
 
 Values are merged **per field**, with the authoritative source winning for every
@@ -143,15 +144,18 @@ cd backend
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-132 tests. The physics/ML/crisis suites run standalone; the API suite
-auto-skips unless a backend is live on `:8000`.
+154 tests. The physics/ML/crisis suites run standalone; the API suite
+auto-skips unless POLARIS is live on `:8000` (override with `POLARIS_API_BASE`).
 
 | Suite | Tests | Covers |
 |---|---|---|
 | `test_physics.py` | 22 | solar geometry, turbine curve, fuel model, battery limits |
 | `test_models.py` | 31 | load model, ML forecasting, state estimation, survival, risk |
 | `test_crisis.py` | 37 | all 7 scenarios, operator overrides, before/after |
-| `test_api.py` | 42 | every endpoint, data-honesty labelling, validation |
+| `test_api.py` | 46 | every endpoint, data-honesty labelling, validation |
+| `test_config.py` | 9 | secret masking, CORS, database URL handling |
+| `test_met_norway.py` | 6 | forecast failover, interpolation, radiation estimate |
+| `test_retention.py` | 3 | bounded storage without losing data still in use |
 
 Open <http://localhost:5173> in your browser.
 
@@ -170,7 +174,7 @@ docker compose up --build
 ## Architecture
 
 ```
-REAL-WORLD ANTARCTIC DATA        Maitri SYNOP (WMO 89514) · Open-Meteo · NOAA METAR
+REAL-WORLD ANTARCTIC DATA        Maitri SYNOP (WMO 89514) · Open-Meteo · MET Norway · NOAA METAR
           |
 DATA INGESTION & PREPROCESSING   provider chain, retry + backoff, per-field merge,
           |                      raw payload stored for audit
@@ -364,6 +368,7 @@ and says so, rather than inventing a forecast.
 ## Licence & attribution
 
 Built for the Smart India Hackathon. Weather data courtesy of the WMO Global
-Telecommunication System (via OGIMET), Open-Meteo, and the NOAA Aviation Weather
+Telecommunication System (via OGIMET), Open-Meteo, the Norwegian
+Meteorological Institute (MET Norway, CC BY 4.0), and the NOAA Aviation Weather
 Center. Station energy parameters are modelled — see the data-honesty statement
 above.
