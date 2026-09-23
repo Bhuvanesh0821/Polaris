@@ -13,6 +13,8 @@ Provider chain (lowest `priority` is tried first)
 20  OpenMeteoProvider     Hourly resolution, solar radiation and the forecast
                           horizon the AI models need, at Maitri's real
                           coordinates.
+25  MetNorwayProvider     Independent NWP forecast, so a rate-limited
+                          Open-Meteo cannot take the forecast offline.
 30  NoaaMetarProvider     NOAA Aviation Weather Center METAR from Antarctic
                           aerodromes. Independent failover for the core
                           variables.
@@ -652,6 +654,168 @@ class NoaaMetarProvider(WeatherProvider):
 
 
 # ---------------------------------------------------------------------------
+# 4. MET Norway  -  independent forecast failover
+# ---------------------------------------------------------------------------
+
+
+def _station_pressure(sea_level_hpa: float | None, temp_c: float | None,
+                      elevation_m: float) -> float | None:
+    """Reduce sea-level pressure to station level (barometric formula).
+
+    POLARIS stores station pressure, which drives air density and hence wind
+    turbine output; MET Norway reports only the sea-level value.
+    """
+    if sea_level_hpa is None:
+        return None
+    t = 0.0 if temp_c is None else temp_c
+    lapse = 0.0065 * elevation_m
+    return round(sea_level_hpa * (1.0 - lapse / (t + lapse + 273.15)) ** 5.257, 1)
+
+
+class MetNorwayProvider(WeatherProvider):
+    """Real NWP forecast from the Norwegian Meteorological Institute.
+
+    Failover for the forecast horizon. Open-Meteo is the primary forecast,
+    but on free PaaS hosting it shares a per-IP quota with every other
+    tenant, and when that quota is exhausted POLARIS would have no
+    forward-looking weather at all. MET Norway is a separate service with
+    separate limits.
+
+    Every row is REAL_FORECAST - nothing from here is labelled observed.
+    Its limitations are published in PROVIDER_DESCRIPTIONS:
+
+    - hourly for roughly the first 60 h, then 6-hourly. The 6-hourly tail is
+      linearly interpolated to hourly, as Open-Meteo itself does for coarse
+      model steps, and every interpolated row says so in its raw payload;
+    - no solar radiation - estimated downstream from forecast cloud cover;
+    - sea-level pressure only - reduced to station level here.
+    """
+
+    key = "met_norway"
+    label = "MET Norway Locationforecast (NWP forecast)"
+    priority = 25
+    supports_solar_radiation = False
+    freshness_window_s = 6 * 3600
+
+    URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
+    #: api.met.no refuses anonymous clients: its terms require a User-Agent
+    #: that identifies the application and how to reach its maintainer.
+    CLIENT_ID = "POLARIS/1.0 https://github.com/Bhuvanesh0821/Polaris"
+
+    SCALARS = {
+        "temperature_c": "air_temperature",
+        "apparent_temperature_c": "apparent_air_temperature",
+        "wind_speed_ms": "wind_speed",
+        "humidity_pct": "relative_humidity",
+        "cloud_cover_pct": "cloud_area_fraction",
+        "sea_level_hpa": "air_pressure_at_sea_level",
+    }
+
+    def __init__(self, latitude: float | None = None, longitude: float | None = None,
+                 horizon_h: int | None = None, **kw) -> None:
+        super().__init__(**kw)
+        self.latitude = latitude if latitude is not None else SITE.latitude
+        self.longitude = longitude if longitude is not None else SITE.longitude
+        self.horizon_h = horizon_h or settings.forecast_horizon_h
+
+    async def _fetch(self, client):
+        params = {"lat": round(self.latitude, 4), "lon": round(self.longitude, 4),
+                  "altitude": int(SITE.elevation_m)}
+        resp = await client.get(self.URL, params=params,
+                                headers={"User-Agent": self.CLIENT_ID})
+        resp.raise_for_status()
+        data = resp.json()
+        series = (data.get("properties") or {}).get("timeseries") or []
+        if not series:
+            raise RuntimeError("MET Norway returned no timeseries")
+        model_run = ((data.get("properties") or {}).get("meta") or {}).get("updated_at")
+
+        steps: list[tuple[datetime, dict]] = []
+        for entry in series:
+            try:
+                ts = datetime.fromisoformat(entry["time"].replace("Z", "+00:00"))
+            except (KeyError, ValueError):
+                continue
+            det = ((entry.get("data") or {}).get("instant") or {}).get("details") or {}
+            if det.get("air_temperature") is None or det.get("wind_speed") is None:
+                continue
+            steps.append((ts, det))
+        if not steps:
+            raise RuntimeError("MET Norway timeseries had no usable steps")
+
+        current_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        last_hour = current_hour + timedelta(hours=self.horizon_h)
+        readings: list[WeatherReading] = []
+
+        def emit(ts: datetime, vals: dict, interpolated_from: tuple | None) -> None:
+            # Forecast hours only: the current hour is not an observation.
+            if not (current_hour < ts <= last_hour):
+                return
+            readings.append(WeatherReading(
+                observed_at=ts,
+                provenance=DataProvenance.REAL_FORECAST,
+                source=self.label,
+                source_provider=self.key,
+                source_station_code=f"{self.latitude:.4f},{self.longitude:.4f}",
+                temperature_c=vals["temperature_c"],
+                apparent_temperature_c=vals["apparent_temperature_c"],
+                wind_speed_ms=vals["wind_speed_ms"],
+                wind_direction_deg=vals["wind_direction_deg"],
+                humidity_pct=vals["humidity_pct"],
+                cloud_cover_pct=vals["cloud_cover_pct"],
+                pressure_hpa=_station_pressure(vals["sea_level_hpa"],
+                                               vals["temperature_c"], SITE.elevation_m),
+                solar_radiation_wm2=None,  # not provided by this service
+                raw_payload={
+                    "provider": self.key,
+                    "model_run": model_run,
+                    "interpolated": interpolated_from is not None,
+                    **({"between": [t.isoformat() for t in interpolated_from]}
+                       if interpolated_from else {}),
+                    "values": vals,
+                },
+            ))
+
+        def pick(det: dict) -> dict:
+            v = {k: det.get(src) for k, src in self.SCALARS.items()}
+            v["wind_direction_deg"] = det.get("wind_from_direction")
+            return v
+
+        for (t0, d0), nxt in zip(steps, steps[1:] + [None]):
+            v0 = pick(d0)
+            emit(t0, v0, None)
+            if nxt is None:
+                break
+            t1, d1 = nxt
+            gap_h = int((t1 - t0).total_seconds() // 3600)
+            if gap_h <= 1:
+                continue
+            v1 = pick(d1)
+            for k in range(1, gap_h):
+                f = k / gap_h
+                vals = {
+                    name: (None if v0[name] is None or v1[name] is None
+                           else round(v0[name] + f * (v1[name] - v0[name]), 2))
+                    for name in self.SCALARS
+                }
+                vals["wind_direction_deg"] = _interp_direction(
+                    v0["wind_direction_deg"], v1["wind_direction_deg"], f)
+                emit(t0 + timedelta(hours=k), vals, (t0, t1))
+
+        if not readings:
+            raise RuntimeError("MET Norway returned no future hours")
+        return readings, resp.status_code, str(resp.url)
+
+
+def _interp_direction(d0: float | None, d1: float | None, f: float) -> float | None:
+    """Interpolate a compass bearing along the shorter arc (350 -> 10 via 0)."""
+    if d0 is None or d1 is None:
+        return None
+    delta = ((d1 - d0 + 180.0) % 360.0) - 180.0
+    return round((d0 + f * delta) % 360.0, 1)
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -659,7 +823,8 @@ class NoaaMetarProvider(WeatherProvider):
 def default_providers() -> list[WeatherProvider]:
     """The live chain used by the scheduled refresh, in priority order."""
     return sorted(
-        [OgimetSynopProvider(), OpenMeteoProvider(), NoaaMetarProvider()],
+        [OgimetSynopProvider(), OpenMeteoProvider(), MetNorwayProvider(),
+         NoaaMetarProvider()],
         key=lambda p: p.priority,
     )
 
@@ -683,6 +848,18 @@ PROVIDER_DESCRIPTIONS = {
         "variables": ["temperature", "wind", "solar radiation", "humidity",
                       "pressure", "cloud cover", "snowfall"],
         "missing": [],
+        "authoritative": False,
+    },
+    MetNorwayProvider.key: {
+        "label": MetNorwayProvider.label,
+        "kind": "REAL NWP forecast (forecast failover)",
+        "station": f"{SITE.latitude:.4f}, {SITE.longitude:.4f} (Maitri)",
+        "cadence": "hourly to ~+60 h, 6-hourly beyond (linearly interpolated "
+                   "to hourly; interpolated rows are flagged)",
+        "variables": ["temperature", "wind speed", "wind direction", "humidity",
+                      "pressure (reduced from sea level)", "cloud cover"],
+        "missing": ["solar radiation (estimated from forecast cloud cover)",
+                    "snowfall"],
         "authoritative": False,
     },
     NoaaMetarProvider.key: {
