@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.database.session import SessionLocal
 from app.services.pipeline import backfill_history_if_needed, run_pipeline
+from app.services.retention import prune_old_data
 from app.services.weather.ingest import run_ingestion
 
 log = logging.getLogger("polaris.scheduler")
@@ -105,6 +106,16 @@ async def refresh_once(trigger: str = "scheduled", run_ai: bool = True) -> dict:
                                  "POLARIS does not run the model on "
                                  "fabricated inputs.",
                     }
+
+            # Keep storage bounded on the hosted database. Housekeeping must
+            # never fail a refresh, so errors are logged and swallowed.
+            try:
+                pruned = prune_old_data(db)
+                if pruned:
+                    out["retention"] = pruned
+            except Exception as exc:
+                db.rollback()
+                log.warning("Retention pruning skipped: %s", exc)
 
             if ok:
                 state.last_success_at = datetime.now(timezone.utc)
