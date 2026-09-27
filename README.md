@@ -6,6 +6,8 @@ AI-driven smart energy management for polar research stations.
 
 `Python | FastAPI | React | PostgreSQL | JavaScript | HTML/CSS`
 
+**Live dashboard:** <https://polaris-phi-two.vercel.app>
+
 ---
 
 ## REAL WEATHER DATA + RESEARCH-BASED ENERGY MODEL
